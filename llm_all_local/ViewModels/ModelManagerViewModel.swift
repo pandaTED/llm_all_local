@@ -18,12 +18,12 @@ final class ModelManagerViewModel: ObservableObject {
     var recommendedModel: ModelConfig? {
         let tier = DeviceCapabilityService.suggestedModelTier
         switch tier {
-        case "8B":
-            return models.first(where: { $0.name.contains("8B") })
         case "4B":
             return models.first(where: { $0.name.contains("4B") })
+        case "2B":
+            return models.first(where: { $0.name.contains("2B") })
         default:
-            return models.first(where: { $0.name.contains("1.7B") })
+            return models.first(where: { $0.name.contains("0.8B") })
         }
     }
 
