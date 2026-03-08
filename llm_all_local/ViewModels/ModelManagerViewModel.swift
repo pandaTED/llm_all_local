@@ -124,6 +124,7 @@ final class ModelManagerViewModel: ObservableObject {
             if FileManager.default.fileExists(atPath: localURL.path) {
                 try FileManager.default.removeItem(at: localURL)
             }
+            try? downloadService.clearResumeData(for: model)
             setDownloaded(false, for: model.id)
             setProgress(0, for: model.id)
         } catch {

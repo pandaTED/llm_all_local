@@ -67,6 +67,14 @@ final class ModelDownloadService: NSObject {
         return URLSession(configuration: config, delegate: self, delegateQueue: nil)
     }()
 
+    private lazy var segmentSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.waitsForConnectivity = true
+        config.timeoutIntervalForResource = 60 * 60 * 24
+        config.httpMaximumConnectionsPerHost = multipartMaxThreads
+        return URLSession(configuration: config)
+    }()
+
     static func modelsDirectory() throws -> URL {
         let base = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let folder = base.appendingPathComponent("models", isDirectory: true)
@@ -85,6 +93,7 @@ final class ModelDownloadService: NSObject {
     ) async throws -> URL {
         let destination = try Self.localURL(for: model)
         if FileManager.default.fileExists(atPath: destination.path) {
+            try? clearResumeData(for: model)
             progress(1.0)
             return destination
         }
@@ -117,6 +126,12 @@ final class ModelDownloadService: NSObject {
                     )
                 }
             } catch {
+                if error is CancellationError {
+                    throw error
+                }
+                if let urlError = error as? URLError, urlError.code == .cancelled {
+                    throw error
+                }
                 return try await downloadSingle(
                     from: probe.finalURL,
                     destination: destination,
@@ -138,6 +153,15 @@ final class ModelDownloadService: NSObject {
         session.getAllTasks { tasks in
             tasks.forEach { $0.cancel() }
         }
+        segmentSession.getAllTasks { tasks in
+            tasks.forEach { $0.cancel() }
+        }
+    }
+
+    func clearResumeData(for model: ModelConfig) throws {
+        let destination = try Self.localURL(for: model)
+        let resumeDirectory = try Self.resumeDirectory(for: destination, createIfNeeded: false)
+        try Self.removeItemIfExists(at: resumeDirectory)
     }
 
     private func downloadSingle(
@@ -166,33 +190,46 @@ final class ModelDownloadService: NSObject {
         allowsCellularAccess: Bool,
         progress: @escaping @Sendable (Double) -> Void
     ) async throws -> URL {
+        let resumeDirectory = try Self.resumeDirectory(for: destination, createIfNeeded: true)
         let segments = makeSegments(for: contentLength)
-        let tempDirectory = FileManager.default.temporaryDirectory.appendingPathComponent(
-            "llm-download-\(UUID().uuidString)",
-            isDirectory: true
-        )
-
-        try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
-        defer {
-            try? FileManager.default.removeItem(at: tempDirectory)
-        }
-
         var orderedPartURLs: [URL?] = Array(repeating: nil, count: segments.count)
         var completedBytes: Int64 = 0
+        var pendingSegments: [SegmentSpec] = []
 
-        progress(0)
+        for segment in segments {
+            let partURL = Self.partFileURL(in: resumeDirectory, index: segment.index)
+            if let existingSize = Self.fileSize(at: partURL), existingSize == segment.expectedLength {
+                orderedPartURLs[segment.index] = partURL
+                completedBytes += existingSize
+            } else {
+                if FileManager.default.fileExists(atPath: partURL.path) {
+                    try? FileManager.default.removeItem(at: partURL)
+                }
+                pendingSegments.append(segment)
+            }
+        }
+
+        let initialRatio = min(0.98, max(0, Double(completedBytes) / Double(contentLength)))
+        progress(initialRatio)
 
         try await withThrowingTaskGroup(of: SegmentResult.self) { group in
-            for segment in segments {
+            for segment in pendingSegments {
                 let request = makeRangeRequest(
                     url: remoteURL,
                     start: segment.start,
                     end: segment.end,
                     allowsCellularAccess: allowsCellularAccess
                 )
+                let outputFileURL = Self.partFileURL(in: resumeDirectory, index: segment.index)
+                let segmentSession = self.segmentSession
 
                 group.addTask {
-                    try await Self.downloadSegment(request: request, index: segment.index, outputDirectory: tempDirectory)
+                    try await Self.downloadSegment(
+                        using: segmentSession,
+                        request: request,
+                        index: segment.index,
+                        outputFileURL: outputFileURL
+                    )
                 }
             }
 
@@ -218,6 +255,7 @@ final class ModelDownloadService: NSObject {
         do {
             try merge(segmentFiles: finalParts, into: destination)
             try markExcludedFromBackup(url: destination)
+            try Self.removeItemIfExists(at: resumeDirectory)
             progress(1.0)
             return destination
         } catch {
@@ -263,11 +301,12 @@ final class ModelDownloadService: NSObject {
     }
 
     private static func downloadSegment(
+        using session: URLSession,
         request: URLRequest,
         index: Int,
-        outputDirectory: URL
+        outputFileURL: URL
     ) async throws -> SegmentResult {
-        let (temporaryFile, response) = try await URLSession.shared.download(for: request)
+        let (temporaryFile, response) = try await session.download(for: request)
 
         guard let http = response as? HTTPURLResponse else {
             throw DownloadError.missingDestination
@@ -284,16 +323,18 @@ final class ModelDownloadService: NSObject {
             throw DownloadError.invalidHTTPStatus(http.statusCode)
         }
 
-        let targetFile = outputDirectory.appendingPathComponent("part-\(index).gguf")
-        if FileManager.default.fileExists(atPath: targetFile.path) {
-            try FileManager.default.removeItem(at: targetFile)
-        }
-        try FileManager.default.moveItem(at: temporaryFile, to: targetFile)
+        let targetDirectory = outputFileURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: targetDirectory, withIntermediateDirectories: true)
 
-        let attrs = try FileManager.default.attributesOfItem(atPath: targetFile.path)
+        if FileManager.default.fileExists(atPath: outputFileURL.path) {
+            try FileManager.default.removeItem(at: outputFileURL)
+        }
+        try FileManager.default.moveItem(at: temporaryFile, to: outputFileURL)
+
+        let attrs = try FileManager.default.attributesOfItem(atPath: outputFileURL.path)
         let size = (attrs[.size] as? NSNumber)?.int64Value ?? 0
 
-        return SegmentResult(index: index, fileURL: targetFile, byteCount: size)
+        return SegmentResult(index: index, fileURL: outputFileURL, byteCount: size)
     }
 
     private func makeSegments(for contentLength: Int64) -> [SegmentSpec] {
@@ -335,6 +376,40 @@ final class ModelDownloadService: NSObject {
         var request = makeBaseRequest(url: url, allowsCellularAccess: allowsCellularAccess)
         request.setValue("bytes=\(start)-\(end)", forHTTPHeaderField: "Range")
         return request
+    }
+
+    private static func resumeDirectory(for destination: URL, createIfNeeded: Bool) throws -> URL {
+        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        let root = caches.appendingPathComponent("model-download-resume", isDirectory: true)
+        if createIfNeeded {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        } else if !FileManager.default.fileExists(atPath: root.path) {
+            return root.appendingPathComponent(destination.lastPathComponent + ".parts", isDirectory: true)
+        }
+
+        let directory = root.appendingPathComponent(destination.lastPathComponent + ".parts", isDirectory: true)
+        if createIfNeeded {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+        return directory
+    }
+
+    private static func partFileURL(in directory: URL, index: Int) -> URL {
+        directory.appendingPathComponent("part-\(index).gguf.part")
+    }
+
+    private static func fileSize(at url: URL) -> Int64? {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return nil
+        }
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        return (attrs?[.size] as? NSNumber)?.int64Value
+    }
+
+    private static func removeItemIfExists(at url: URL) throws {
+        if FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.removeItem(at: url)
+        }
     }
 
     private func merge(segmentFiles: [URL], into destination: URL) throws {
