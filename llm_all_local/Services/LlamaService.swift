@@ -110,6 +110,18 @@ actor LlamaService {
 
                         if let string = String(validatingUTF8: pendingInvalidUTF8 + [0]) {
                             pendingInvalidUTF8.removeAll(keepingCapacity: true)
+                            if let stopRange = string.range(of: "<|im_end|>") {
+                                let trimmed = String(string[..<stopRange.lowerBound])
+                                if !trimmed.isEmpty {
+                                    continuation.yield(trimmed)
+                                }
+                                break
+                            }
+
+                            if string.contains("<|im_start|>") || string.contains("<|endoftext|>") {
+                                break
+                            }
+
                             continuation.yield(string)
                         }
 
@@ -177,31 +189,125 @@ actor LlamaService {
     }
 
     private func buildChatPrompt(messages: [ChatMessage], systemPrompt: String) -> String {
-        var prompt = "<|im_start|>system\\n\(systemPrompt)<|im_end|>\\n"
+#if canImport(llama) || canImport(LlamaSwift)
+        if let model, let templated = buildPromptFromModelTemplate(model: model, messages: messages, systemPrompt: systemPrompt) {
+            return templated
+        }
+#endif
+
+        var prompt = "<|im_start|>system\n\(systemPrompt)<|im_end|>\n"
 
         for message in messages {
             switch message.role {
             case .system:
                 continue
             case .user:
-                prompt += "<|im_start|>user\\n\(message.content)<|im_end|>\\n"
+                prompt += "<|im_start|>user\n\(message.content)<|im_end|>\n"
             case .assistant:
-                prompt += "<|im_start|>assistant\\n\(message.content)<|im_end|>\\n"
+                prompt += "<|im_start|>assistant\n\(message.content)<|im_end|>\n"
             }
         }
 
-        prompt += "<|im_start|>assistant\\n"
+        prompt += "<|im_start|>assistant\n"
         return prompt
     }
 
 #if canImport(llama) || canImport(LlamaSwift)
+    private func buildPromptFromModelTemplate(
+        model: OpaquePointer,
+        messages: [ChatMessage],
+        systemPrompt: String
+    ) -> String? {
+        let template = llama_model_chat_template(model, nil)
+        guard template != nil else {
+            return nil
+        }
+
+        var cStrings: [UnsafeMutablePointer<CChar>] = []
+        defer {
+            cStrings.forEach { free($0) }
+        }
+
+        func makeCString(_ value: String) -> UnsafeMutablePointer<CChar>? {
+            guard let ptr = strdup(value) else { return nil }
+            cStrings.append(ptr)
+            return ptr
+        }
+
+        var chat: [llama_chat_message] = []
+
+        if let role = makeCString("system"), let content = makeCString(systemPrompt) {
+            chat.append(llama_chat_message(role: UnsafePointer(role), content: UnsafePointer(content)))
+        } else {
+            return nil
+        }
+
+        for message in messages where !message.content.isEmpty {
+            let roleString: String
+            switch message.role {
+            case .system:
+                roleString = "system"
+            case .user:
+                roleString = "user"
+            case .assistant:
+                roleString = "assistant"
+            }
+
+            guard let role = makeCString(roleString), let content = makeCString(message.content) else {
+                return nil
+            }
+            chat.append(llama_chat_message(role: UnsafePointer(role), content: UnsafePointer(content)))
+        }
+
+        let estimatedChars = max(
+            2048,
+            systemPrompt.utf8.count + messages.reduce(0) { $0 + $1.content.utf8.count } * 3 + 512
+        )
+        var buffer = [CChar](repeating: 0, count: estimatedChars)
+
+        let count = chat.withUnsafeBufferPointer { ptr in
+            llama_chat_apply_template(
+                template,
+                ptr.baseAddress,
+                ptr.count,
+                true,
+                &buffer,
+                Int32(buffer.count)
+            )
+        }
+
+        if count < 0 {
+            return nil
+        }
+
+        if Int(count) >= buffer.count {
+            var resized = [CChar](repeating: 0, count: Int(count) + 1)
+            let second = chat.withUnsafeBufferPointer { ptr in
+                llama_chat_apply_template(
+                    template,
+                    ptr.baseAddress,
+                    ptr.count,
+                    true,
+                    &resized,
+                    Int32(resized.count)
+                )
+            }
+            guard second >= 0 else {
+                return nil
+            }
+            return String(cString: resized)
+        }
+
+        return String(cString: buffer)
+    }
+
     private func tokenize(text: String, vocab: OpaquePointer, addBos: Bool) -> [llama_token] {
         let utf8Count = text.utf8.count
         let maxCount = utf8Count + (addBos ? 2 : 1)
         let tokens = UnsafeMutablePointer<llama_token>.allocate(capacity: maxCount)
         defer { tokens.deallocate() }
 
-        let actual = llama_tokenize(vocab, text, Int32(utf8Count), tokens, Int32(maxCount), addBos, false)
+        let actual = llama_tokenize(vocab, text, Int32(utf8Count), tokens, Int32(maxCount), addBos, true)
         if actual <= 0 {
             return []
         }
