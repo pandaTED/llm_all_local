@@ -37,6 +37,7 @@ final class ChatViewModel: ObservableObject {
     private var generationTask: Task<Void, Never>?
     private var observers: [NSObjectProtocol] = []
     private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
+    private var shouldAutoReloadModelAfterBackground = false
 
     private enum Keys {
         static let systemPrompt = "chat.systemPrompt"
@@ -134,6 +135,7 @@ final class ChatViewModel: ObservableObject {
     }
 
     func unloadModel() {
+        shouldAutoReloadModelAfterBackground = false
         generationTask?.cancel()
         generationTask = nil
         isGenerating = false
@@ -442,8 +444,17 @@ final class ChatViewModel: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                if self.isGenerating {
-                    self.beginBackgroundTaskIfNeeded()
+                guard self.isModelLoaded else { return }
+
+                self.shouldAutoReloadModelAfterBackground = self.defaults.string(forKey: Keys.selectedModelPath) != nil
+                self.unloadModelForBackground()
+
+                if self.memoryWarningBanner == nil {
+                    self.memoryWarningBanner = "App moved to background. Model unloaded automatically."
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    if self.memoryWarningBanner == "App moved to background. Model unloaded automatically." {
+                        self.memoryWarningBanner = nil
+                    }
                 }
             }
         }
@@ -454,7 +465,21 @@ final class ChatViewModel: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.endBackgroundTaskIfNeeded()
+                guard let self else { return }
+                self.endBackgroundTaskIfNeeded()
+
+                guard
+                    self.shouldAutoReloadModelAfterBackground,
+                    !self.isModelLoading,
+                    !self.isModelLoaded,
+                    let path = self.defaults.string(forKey: Keys.selectedModelPath)
+                else {
+                    return
+                }
+
+                self.shouldAutoReloadModelAfterBackground = false
+                let name = self.defaults.string(forKey: Keys.selectedModelName)
+                await self.loadModel(at: path, displayName: name)
             }
         }
 
@@ -476,6 +501,21 @@ final class ChatViewModel: ObservableObject {
         guard backgroundTaskID != .invalid else { return }
         UIApplication.shared.endBackgroundTask(backgroundTaskID)
         backgroundTaskID = .invalid
+    }
+
+    private func unloadModelForBackground() {
+        generationTask?.cancel()
+        generationTask = nil
+        isGenerating = false
+
+        Task {
+            await llamaService.unloadModel()
+        }
+
+        isModelLoaded = false
+        modelLoadError = nil
+        endBackgroundTaskIfNeeded()
+        resourceMonitor.setInferenceState(active: false, tokensPerSecond: 0)
     }
 
     private func trimContextIfNeeded() {

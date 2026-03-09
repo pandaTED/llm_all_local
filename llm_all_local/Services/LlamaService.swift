@@ -12,6 +12,7 @@ actor LlamaService {
     private var model: OpaquePointer?
     private var vocab: OpaquePointer?
 #endif
+    private var decodeBatchSize: Int32 = 512
     private(set) var session: InferenceSession?
 
     func loadModel(at path: String, contextLength: Int32 = 4096) throws {
@@ -49,6 +50,7 @@ actor LlamaService {
         model = loadedModel
         context = loadedContext
         vocab = loadedVocab
+        decodeBatchSize = Int32(contextParams.n_batch)
         session = InferenceSession(
             modelPath: path,
             modelName: URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent,
@@ -82,10 +84,26 @@ actor LlamaService {
             throw LlamaError.emptyPrompt
         }
 
+        if promptTokens.count >= session.contextLength {
+            throw LlamaError.contextLimitReached
+        }
+
+        let decodeBatchSize = self.decodeBatchSize
+
         return AsyncThrowingStream { continuation in
-            Task(priority: .userInitiated) {
+            let stream = StreamContinuationController(continuation)
+
+            let worker = Task(priority: .userInitiated) {
+                defer {
+                    llama_memory_clear(llama_get_memory(context), false)
+                }
+
                 do {
-                    try Self.prefill(context: context, promptTokens: promptTokens)
+                    try Self.prefill(
+                        context: context,
+                        promptTokens: promptTokens,
+                        maxBatchTokens: decodeBatchSize
+                    )
                     let sampler = try Self.makeSampler(temperature: temperature)
                     defer { llama_sampler_free(sampler) }
 
@@ -113,7 +131,7 @@ actor LlamaService {
                             if let stopRange = string.range(of: "<|im_end|>") {
                                 let trimmed = String(string[..<stopRange.lowerBound])
                                 if !trimmed.isEmpty {
-                                    continuation.yield(trimmed)
+                                    stream.yield(trimmed)
                                 }
                                 break
                             }
@@ -122,7 +140,7 @@ actor LlamaService {
                                 break
                             }
 
-                            continuation.yield(string)
+                            stream.yield(string)
                         }
 
                         var nextBatch = llama_batch_init(1, 0, 1)
@@ -151,17 +169,20 @@ actor LlamaService {
                     if !pendingInvalidUTF8.isEmpty {
                         let flushed = String(cString: pendingInvalidUTF8 + [0])
                         if !flushed.isEmpty {
-                            continuation.yield(flushed)
+                            stream.yield(flushed)
                         }
                     }
 
-                    llama_memory_clear(llama_get_memory(context), false)
-                    continuation.finish()
+                    stream.finish()
                 } catch is CancellationError {
-                    continuation.finish()
+                    stream.finish()
                 } catch {
-                    continuation.finish(throwing: error)
+                    stream.finish(throwing: error)
                 }
+            }
+
+            continuation.onTermination = { @Sendable _ in
+                worker.cancel()
             }
         }
 #else
@@ -181,6 +202,7 @@ actor LlamaService {
         context = nil
         model = nil
         vocab = nil
+        decodeBatchSize = 512
         session = nil
         llama_backend_free()
 #else
@@ -322,25 +344,41 @@ actor LlamaService {
         return result
     }
 
-    private static func prefill(context: OpaquePointer, promptTokens: [llama_token]) throws {
-        var batch = llama_batch_init(Int32(max(promptTokens.count, 1)), 0, 1)
-        defer { llama_batch_free(batch) }
+    private static func prefill(
+        context: OpaquePointer,
+        promptTokens: [llama_token],
+        maxBatchTokens: Int32
+    ) throws {
+        let chunkSize = max(1, Int(maxBatchTokens))
+        var start = 0
 
-        batch.n_tokens = 0
+        while start < promptTokens.count {
+            let end = min(start + chunkSize, promptTokens.count)
+            let count = end - start
+            var batch = llama_batch_init(Int32(count), 0, 1)
+            batch.n_tokens = 0
 
-        for index in 0..<promptTokens.count {
-            batch.token[Int(batch.n_tokens)] = promptTokens[index]
-            batch.pos[Int(batch.n_tokens)] = Int32(index)
-            batch.n_seq_id[Int(batch.n_tokens)] = 1
-            batch.seq_id[Int(batch.n_tokens)]?[0] = 0
-            batch.logits[Int(batch.n_tokens)] = 0
-            batch.n_tokens += 1
-        }
+            for index in start..<end {
+                let localIndex = Int(batch.n_tokens)
+                batch.token[localIndex] = promptTokens[index]
+                batch.pos[localIndex] = Int32(index)
+                batch.n_seq_id[localIndex] = 1
+                batch.seq_id[localIndex]?[0] = 0
+                batch.logits[localIndex] = 0
+                batch.n_tokens += 1
+            }
 
-        batch.logits[Int(batch.n_tokens) - 1] = 1
+            if end == promptTokens.count {
+                batch.logits[Int(batch.n_tokens) - 1] = 1
+            }
 
-        if llama_decode(context, batch) != 0 {
-            throw LlamaError.decodeFailed
+            if llama_decode(context, batch) != 0 {
+                llama_batch_free(batch)
+                throw LlamaError.decodeFailed
+            }
+
+            llama_batch_free(batch)
+            start = end
         }
     }
 
@@ -375,6 +413,39 @@ actor LlamaService {
         return Array(UnsafeBufferPointer(start: smallBuffer, count: Int(size)))
     }
 #endif
+}
+
+private final class StreamContinuationController: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isFinished = false
+    private let continuation: AsyncThrowingStream<String, Error>.Continuation
+
+    init(_ continuation: AsyncThrowingStream<String, Error>.Continuation) {
+        self.continuation = continuation
+    }
+
+    func yield(_ value: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isFinished else { return }
+        continuation.yield(value)
+    }
+
+    func finish() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isFinished else { return }
+        isFinished = true
+        continuation.finish()
+    }
+
+    func finish(throwing error: Error) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isFinished else { return }
+        isFinished = true
+        continuation.finish(throwing: error)
+    }
 }
 
 enum LlamaError: LocalizedError {

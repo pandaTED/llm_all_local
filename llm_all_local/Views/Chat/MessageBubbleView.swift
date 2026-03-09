@@ -28,21 +28,30 @@ struct MessageBubbleView: View {
                     attachmentGrid(isUser: isUser)
                 }
 
-                contentView(isUser: isUser)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
-                    .background(isUser ? Color.accentColor : Color(.systemGray5))
-                    .foregroundStyle(isUser ? .white : .primary)
-                    .clipShape(RoundedRectangle(cornerRadius: 18))
-                    .textSelection(.enabled)
-                    .contextMenu {
-                        Button("Copy", systemImage: "doc.on.doc") {
-                            UIPasteboard.general.string = message.content
-                        }
-                    }
+                bubbleContent(isUser: isUser)
             }
 
             if !isUser { Spacer(minLength: 60) }
+        }
+    }
+
+    @ViewBuilder
+    private func bubbleContent(isUser: Bool) -> some View {
+        let base = contentView(isUser: isUser)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(isUser ? Color.accentColor : Color(.systemGray5))
+            .foregroundStyle(isUser ? .white : .primary)
+            .clipShape(RoundedRectangle(cornerRadius: 18))
+
+        if message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || message.isGenerating {
+            base
+        } else {
+            base.contextMenu {
+                Button("Copy", systemImage: "doc.on.doc") {
+                    UIPasteboard.general.string = message.content
+                }
+            }
         }
     }
 
@@ -75,11 +84,13 @@ struct MessageBubbleView: View {
     private func contentView(isUser: Bool) -> some View {
         if isUser {
             textWithCursor(value: message.content, showCursor: false)
-        } else {
+        } else if message.isGenerating {
             TimelineView(.periodic(from: .now, by: 0.5)) { timeline in
-                let showCursor = message.isGenerating && Int(timeline.date.timeIntervalSinceReferenceDate * 2).isMultiple(of: 2)
+                let showCursor = Int(timeline.date.timeIntervalSinceReferenceDate * 2).isMultiple(of: 2)
                 assistantContent(showCursor: showCursor)
             }
+        } else {
+            assistantContent(showCursor: false)
         }
     }
 
