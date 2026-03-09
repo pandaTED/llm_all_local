@@ -1,10 +1,16 @@
 import SwiftUI
+import PhotosUI
+import UIKit
 
 struct ChatView: View {
     @StateObject private var viewModel = ChatViewModel()
     @State private var showModelManager = false
     @State private var showSettings = false
     @State private var showOnboarding = false
+    @State private var showHistory = false
+    @State private var showCamera = false
+    @State private var showPhotoPicker = false
+    @State private var selectedPhotoItem: PhotosPickerItem?
 
     var body: some View {
         NavigationStack {
@@ -43,6 +49,12 @@ struct ChatView: View {
                     .transition(.move(edge: .top).combined(with: .opacity))
                 }
 
+                PerformanceHeaderView(
+                    generation: viewModel.generationStats,
+                    generationSpeedHistory: viewModel.generationSpeedHistory,
+                    resourceSamples: viewModel.resourceSamples
+                )
+
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(spacing: 12) {
@@ -76,22 +88,37 @@ struct ChatView: View {
 
                 InputBarView(
                     text: $viewModel.inputText,
+                    pendingAttachments: viewModel.pendingAttachments,
                     isGenerating: viewModel.isGenerating,
                     onSend: viewModel.sendMessage,
-                    onStop: viewModel.stopGeneration
+                    onStop: viewModel.stopGeneration,
+                    onPickFromLibrary: { showPhotoPicker = true },
+                    onPickFromCamera: {
+                        if UIImagePickerController.isSourceTypeAvailable(.camera) {
+                            showCamera = true
+                        } else {
+                            showPhotoPicker = true
+                        }
+                    },
+                    onRemoveAttachment: { id in
+                        viewModel.removePendingAttachment(id: id)
+                    }
                 )
             }
             .navigationTitle(viewModel.isModelLoaded ? viewModel.selectedModelName : "LLM Chat")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button(action: viewModel.clearChat) {
-                        Image(systemName: "square.and.pencil")
+                    Button(action: { showHistory = true }) {
+                        Image(systemName: "clock.arrow.circlepath")
                     }
-                    .disabled(viewModel.messages.isEmpty)
                 }
 
                 ToolbarItemGroup(placement: .topBarTrailing) {
+                    Button(action: viewModel.clearChat) {
+                        Image(systemName: "square.and.pencil")
+                    }
+
                     Button(action: { showSettings = true }) {
                         Image(systemName: "slider.horizontal.3")
                     }
@@ -118,6 +145,41 @@ struct ChatView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 14))
                     }
                 }
+            }
+            .photosPicker(isPresented: $showPhotoPicker, selection: $selectedPhotoItem, matching: .images)
+            .onChange(of: selectedPhotoItem) { _, newValue in
+                guard let newValue else { return }
+                Task {
+                    if let data = try? await newValue.loadTransferable(type: Data.self),
+                       let image = UIImage(data: data) {
+                        await MainActor.run {
+                            viewModel.addPendingImage(image)
+                        }
+                    }
+                    await MainActor.run {
+                        selectedPhotoItem = nil
+                    }
+                }
+            }
+            .sheet(isPresented: $showCamera) {
+                CameraImagePicker { image in
+                    viewModel.addPendingImage(image)
+                }
+            }
+            .sheet(isPresented: $showHistory) {
+                ConversationHistoryView(
+                    conversations: viewModel.conversations,
+                    activeConversationID: viewModel.activeConversationID,
+                    onSelect: { id in
+                        viewModel.selectConversation(id: id)
+                    },
+                    onDelete: { id in
+                        viewModel.deleteConversation(id: id)
+                    },
+                    onNewChat: {
+                        viewModel.createNewConversation()
+                    }
+                )
             }
             .sheet(isPresented: $showModelManager) {
                 ModelManagerView(onModelSelected: { path, name in
